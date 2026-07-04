@@ -58,7 +58,25 @@ def init_db():
         created_ts   INTEGER,   -- epoch UTC (segundo)
         created_iso  TEXT,
         is_story     INTEGER DEFAULT 0,
+        story_id     TEXT DEFAULT '',   -- asset_id do story respondido
         raw          TEXT)""")
+    try:
+        con.execute("ALTER TABLE respostas ADD COLUMN story_id TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # coluna já existe
+    con.execute("CREATE INDEX IF NOT EXISTS idx_ts ON respostas(created_ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_story ON respostas(story_id)")
+    # backfill do story_id em linhas antigas (a partir do raw já guardado)
+    for row in con.execute(
+            "SELECT message_id, raw FROM respostas "
+            "WHERE is_story=1 AND (story_id IS NULL OR story_id='')").fetchall():
+        try:
+            sid = _story_id(json.loads(row["raw"] or "{}"))
+        except Exception:
+            sid = ""
+        if sid:
+            con.execute("UPDATE respostas SET story_id=? WHERE message_id=?",
+                        (sid, row["message_id"]))
     con.commit()
     con.close()
 
@@ -165,7 +183,7 @@ FIELD_SETS = [
     "messages.limit(25){id,created_time,from,to,message,story}",
     "messages.limit(25){id,created_time,from,to,message}",
 ]
-MAX_CONV_PAGES = 3   # ~150 conversas mais recentes por coleta
+MAX_CONV_PAGES = 8   # ~400 conversas mais recentes por coleta (folga p/ pico)
 
 
 def _fetch_json(url, params):
@@ -210,6 +228,19 @@ def _consumir_conversas(con, data, my_id):
         pages += 1
 
 
+_ASSET_RE = __import__("re").compile(r"asset_id=(\d+)")
+
+
+def _story_id(m):
+    """Extrai o asset_id do story respondido (identifica QUAL story)."""
+    st = m.get("story") or {}
+    link = (st.get("reply_to") or {}).get("link") or st.get("link") or ""
+    mt = _ASSET_RE.search(link)
+    if mt:
+        return mt.group(1)
+    return str(st.get("id", "")) if st.get("id") else ""
+
+
 def _gravar_mensagens(con, msgs, my_id):
     for m in msgs:
         frm = m.get("from", {}) or {}
@@ -219,13 +250,16 @@ def _gravar_mensagens(con, msgs, my_id):
         iso = m.get("created_time", "")
         ts = _iso_to_ts(iso)
         is_story = 1 if m.get("story") else 0
+        sid = _story_id(m)
         con.execute(
             "INSERT INTO respostas(message_id,from_username,from_id,texto,"
-            "created_ts,created_iso,is_story,raw) VALUES(?,?,?,?,?,?,?,?) "
+            "created_ts,created_iso,is_story,story_id,raw) VALUES(?,?,?,?,?,?,?,?,?) "
             "ON CONFLICT(message_id) DO UPDATE SET "
-            "is_story=MAX(respostas.is_story, excluded.is_story)",
+            "is_story=MAX(respostas.is_story, excluded.is_story), "
+            "story_id=CASE WHEN excluded.story_id!='' THEN excluded.story_id "
+            "ELSE respostas.story_id END",
             (m.get("id"), frm.get("username", ""), fid, m.get("message", ""),
-             ts, iso, is_story, json.dumps(m)[:4000]))
+             ts, iso, is_story, sid, json.dumps(m)[:4000]))
 
 
 def _iso_to_ts(iso):
@@ -280,10 +314,38 @@ def _hoje_sp():
     return dt.strftime("%Y-%m-%d")
 
 
+def _dia_bounds(dia):
+    ini = int((datetime.strptime(dia, "%Y-%m-%d")
+               - timedelta(hours=TZ_OFFSET)).replace(tzinfo=timezone.utc).timestamp())
+    return ini, ini + 86400
+
+
+def _query_rows(con, dia, so_story, story):
+    ini, fim = _dia_bounds(dia)
+    q = "SELECT * FROM respostas WHERE created_ts>=? AND created_ts<? "
+    p = [ini, fim]
+    if story:
+        q += "AND story_id=? "
+        p.append(story)
+    elif so_story:
+        q += "AND is_story=1 "
+    q += "ORDER BY created_ts ASC"
+    return con.execute(q, p).fetchall()
+
+
+def _stories_do_dia(con, dia):
+    ini, fim = _dia_bounds(dia)
+    return con.execute(
+        "SELECT story_id, COUNT(*) c, MIN(created_ts) mn, MAX(created_ts) mx "
+        "FROM respostas WHERE created_ts>=? AND created_ts<? AND is_story=1 "
+        "AND story_id!='' GROUP BY story_id ORDER BY mn", (ini, fim)).fetchall()
+
+
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request,
          data: str = Query(default=""),
-         so_story: int = Query(default=1)):
+         so_story: int = Query(default=1),
+         story: str = Query(default="")):
     _check_auth(request)
 
     if not setting_get("ig_token"):
@@ -292,15 +354,9 @@ def home(request: Request,
             "<p><a href='/auth/start'>Autorizar agora</a></p>")
 
     dia = data or _hoje_sp()
-    ini = int((datetime.strptime(dia, "%Y-%m-%d")
-               - timedelta(hours=TZ_OFFSET)).replace(tzinfo=timezone.utc).timestamp())
-    fim = ini + 86400
-
     con = db()
-    q = ("SELECT * FROM respostas WHERE created_ts>=? AND created_ts<? "
-         + ("AND is_story=1 " if so_story else "")
-         + "ORDER BY created_ts ASC")
-    rows = con.execute(q, (ini, fim)).fetchall()
+    rows = _query_rows(con, dia, so_story, story)
+    stories = _stories_do_dia(con, dia)
     datas = [r["d"] for r in con.execute(
         "SELECT DISTINCT strftime('%Y-%m-%d', created_ts, 'unixepoch', ?) AS d "
         "FROM respostas ORDER BY d DESC", (f"{TZ_OFFSET} hours",)).fetchall()]
@@ -311,6 +367,12 @@ def home(request: Request,
         f"<option value='{d}' {'selected' if d==dia else ''}>{d}</option>" for d in datas)
     if dia not in datas:
         opts = f"<option value='{dia}' selected>{dia}</option>" + opts
+
+    story_opts = f"<option value=''>todos os stories</option>"
+    for s in stories:
+        sel = "selected" if s["story_id"] == story else ""
+        story_opts += (f"<option value='{s['story_id']}' {sel}>"
+                       f"story {_fmt_hora(s['mn'])}–{_fmt_hora(s['mx'])} · {s['c']} resp.</option>")
 
     linhas = ""
     for i, r in enumerate(rows, 1):
@@ -323,25 +385,22 @@ def home(request: Request,
             f"<td>{_fmt_data(r['created_ts'])}</td>"
             f"<td class='hora'>{_fmt_hora(r['created_ts'])}</td></tr>")
     if not linhas:
-        linhas = "<tr><td colspan='5' class='vazio'>Nenhuma resposta ainda nesse dia.</td></tr>"
+        linhas = "<tr><td colspan='5' class='vazio'>Nenhuma resposta ainda aqui.</td></tr>"
 
     chk = "checked" if so_story else ""
     return HTMLResponse(PAGE.format(
-        opts=opts, linhas=linhas, total=total, chk=chk,
-        so_story=so_story, dia=dia, atualizado=_fmt_hora(int(time.time()))))
+        opts=opts, story_opts=story_opts, linhas=linhas, total=total, chk=chk,
+        so_story=so_story, dia=dia, story=story, mostrando=len(rows),
+        atualizado=_fmt_hora(int(time.time()))))
 
 
 @app.get("/export.csv")
-def export_csv(request: Request, data: str = Query(default=""), so_story: int = 1):
+def export_csv(request: Request, data: str = Query(default=""),
+               so_story: int = 1, story: str = Query(default="")):
     _check_auth(request)
     dia = data or _hoje_sp()
-    ini = int((datetime.strptime(dia, "%Y-%m-%d")
-               - timedelta(hours=TZ_OFFSET)).replace(tzinfo=timezone.utc).timestamp())
-    fim = ini + 86400
     con = db()
-    q = ("SELECT * FROM respostas WHERE created_ts>=? AND created_ts<? "
-         + ("AND is_story=1 " if so_story else "") + "ORDER BY created_ts ASC")
-    rows = con.execute(q, (ini, fim)).fetchall()
+    rows = _query_rows(con, dia, so_story, story)
     con.close()
     out = "posicao,usuario,resposta,data,hora\n"
     for i, r in enumerate(rows, 1):
@@ -387,10 +446,11 @@ PAGE = """<!doctype html><html lang=pt-br><head><meta charset=utf-8>
  <h1>🎯 Bolão</h1>
  <form method=get style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
    <label>Data <select name=data onchange="this.form.submit()">{opts}</select></label>
+   <label>Story <select name=story onchange="this.form.submit()">{story_opts}</select></label>
    <label><input type=checkbox name=so_story value=1 {chk} onchange="this.form.submit()"> só respostas de story</label>
  </form>
- <span class=muted>{total} respostas no total · atualiza sozinho · {atualizado}</span>
- <a class=btn href="/export.csv?data={dia}&so_story={so_story}">baixar CSV</a>
+ <span class=muted>mostrando {mostrando} · {total} no total · atualiza sozinho · {atualizado}</span>
+ <a class=btn href="/export.csv?data={dia}&so_story={so_story}&story={story}">baixar CSV</a>
 </header>
 <table>
  <thead><tr><th>#</th><th>quem</th><th>resposta</th><th>data</th><th>hora</th></tr></thead>
