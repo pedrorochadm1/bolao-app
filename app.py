@@ -131,6 +131,33 @@ def auth_callback(code: str = "", error: str = "", error_description: str = ""):
     return RedirectResponse("/")
 
 
+@app.get("/auth/manual")
+def auth_manual(request: Request, token: str = ""):
+    """Injeta um token gerado direto no painel do Instagram ('Gerar token').
+    Protegido por senha. Tenta virar long-lived; se já for, usa como está."""
+    _check_auth(request)
+    if not token:
+        return PlainTextResponse("Passe ?token=...", 400)
+    # tenta estender pra 60 dias (silencioso se já for longo)
+    try:
+        j = requests.get(f"{GRAPH}/access_token", params={
+            "grant_type": "ig_exchange_token",
+            "client_secret": IG_APP_SECRET, "access_token": token}, timeout=20).json()
+        if j.get("access_token"):
+            token = j["access_token"]
+    except Exception:
+        pass
+    me = requests.get(f"{GRAPH}/me", params={
+        "fields": "user_id,username", "access_token": token}, timeout=20).json()
+    if not (me.get("user_id") or me.get("id")):
+        return PlainTextResponse("Token não validou:\n" + json.dumps(me, indent=2), 400)
+    setting_set("ig_token", token)
+    setting_set("ig_user_id", str(me.get("user_id", me.get("id", ""))))
+    setting_set("ig_username", me.get("username", ""))
+    setting_set("token_saved_at", int(time.time()))
+    return PlainTextResponse("OK — conectado como @" + me.get("username", "?"))
+
+
 # ------------------------------------------------------------------ coleta
 FIELD_SETS = [
     "messages{id,created_time,from,to,message,story}",
