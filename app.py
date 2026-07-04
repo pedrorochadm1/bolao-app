@@ -314,10 +314,9 @@ def home(request: Request,
 
     linhas = ""
     for i, r in enumerate(rows, 1):
-        destaque = "top4" if i <= 4 else ""
         texto = (r["texto"] or "").replace("<", "&lt;").replace(">", "&gt;")
         linhas += (
-            f"<tr class='{destaque}'>"
+            f"<tr>"
             f"<td class='pos'>{i}º</td>"
             f"<td>@{r['from_username'] or r['from_id']}</td>"
             f"<td class='txt'>{texto}</td>"
