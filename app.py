@@ -159,10 +159,13 @@ def auth_manual(request: Request, token: str = ""):
 
 
 # ------------------------------------------------------------------ coleta
+# Só as N mensagens mais recentes por conversa; respostas novas jogam a
+# conversa pro topo, então não precisa varrer o histórico inteiro toda hora.
 FIELD_SETS = [
-    "messages{id,created_time,from,to,message,story}",
-    "messages{id,created_time,from,to,message}",
+    "messages.limit(25){id,created_time,from,to,message,story}",
+    "messages.limit(25){id,created_time,from,to,message}",
 ]
+MAX_CONV_PAGES = 3   # ~150 conversas mais recentes por coleta
 
 
 def _fetch_json(url, params):
@@ -177,37 +180,29 @@ def coletar_uma_vez():
     my_id = setting_get("ig_user_id", "")
 
     con = db()
-    for fields in FIELD_SETS:
-        params = {"fields": fields, "access_token": token, "limit": 50}
-        url = f"{GRAPH}/me/conversations"
-        data = _fetch_json(url, params)
-        if "error" in data:
-            # campo inexistente -> tenta o próximo conjunto de fields
-            if data["error"].get("code") in (100,) and fields != FIELD_SETS[-1]:
-                continue
-            print("coleta erro:", json.dumps(data)[:300], flush=True)
-            con.close()
-            return
-        _consumir_conversas(con, data, my_id, token)
-        break
-    con.commit()
-    con.close()
+    try:
+        for fields in FIELD_SETS:
+            params = {"fields": fields, "access_token": token, "limit": 50}
+            data = _fetch_json(f"{GRAPH}/me/conversations", params)
+            if "error" in data:
+                # campo inexistente -> tenta o próximo conjunto de fields
+                if data["error"].get("code") in (100,) and fields != FIELD_SETS[-1]:
+                    continue
+                print("coleta erro:", json.dumps(data)[:300], flush=True)
+                return
+            _consumir_conversas(con, data, my_id)
+            break
+    finally:
+        con.close()
 
 
-def _consumir_conversas(con, data, my_id, token):
+def _consumir_conversas(con, data, my_id):
     pages = 0
-    while data and pages < 30:
+    while data and pages < MAX_CONV_PAGES:
         for conv in data.get("data", []):
             msgs = conv.get("messages", {})
             _gravar_mensagens(con, msgs.get("data", []), my_id)
-            # pagina mensagens dentro da conversa, se houver
-            nxt = msgs.get("paging", {}).get("next")
-            mpages = 0
-            while nxt and mpages < 20:
-                md = _fetch_json(nxt, {})
-                _gravar_mensagens(con, md.get("data", []), my_id)
-                nxt = md.get("paging", {}).get("next")
-                mpages += 1
+        con.commit()   # salva incremental: nunca perde o já coletado
         nextp = data.get("paging", {}).get("next")
         if not nextp:
             break
