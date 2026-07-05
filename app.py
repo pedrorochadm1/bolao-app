@@ -14,6 +14,7 @@ import os
 import json
 import time
 import base64
+import random
 import sqlite3
 import secrets
 import threading
@@ -558,7 +559,8 @@ def _disparo_worker(steps, story, excluir, delay, limite, fallback):
             _DISPARO["enviados"] += 1
         else:
             _DISPARO["falhas"] += 1
-        time.sleep(delay)
+        # jitter: varia o intervalo pra não parecer robô (evita flag de spam)
+        time.sleep(random.uniform(max(1.0, delay * 0.75), delay * 1.75))
     _DISPARO["rodando"] = False
     con.close()
 
