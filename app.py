@@ -463,28 +463,36 @@ def _url_ok(u):
     return u if u.startswith(("http://", "https://")) else "https://" + u
 
 
-def _montar_msg(step, nome, fallback):
+def _montar_msgs(step, nome, fallback):
+    """Retorna uma LISTA de mensagens (um bloco pode virar bolha de texto + card)."""
     t = step.get("type")
     if t == "text":
-        return {"text": _personalizar(step.get("text", ""), nome, fallback)}
+        return [{"text": _personalizar(step.get("text", ""), nome, fallback)}]
     if t == "image":
-        return {"attachment": {"type": "image",
-                               "payload": {"url": step["url"], "is_reusable": True}}}
+        return [{"attachment": {"type": "image",
+                                "payload": {"url": step["url"], "is_reusable": True}}}]
     if t == "buttons":
-        texto = _personalizar(step.get("text", ""), nome, fallback) or " "
-        el = {"title": texto[:80]}
-        if len(texto) > 80:
-            el["subtitle"] = texto[80:160]
-        if step.get("image_url"):
-            el["image_url"] = step["image_url"]
+        texto = _personalizar(step.get("text", ""), nome, fallback)
         btns = [{"type": "web_url", "url": _url_ok(b["url"]),
                  "title": (b.get("label") or b["url"])[:20]}
                 for b in step.get("buttons", []) if b.get("url")]
+        img = step.get("image_url")
+        msgs = []
+        titulo = texto
+        # Card corta em ~80 e quebra palavra: texto longo vira bolha, card fica compacto.
+        if len(texto or "") > 76 or "\n" in (texto or ""):
+            if (texto or "").strip():
+                msgs.append({"text": texto})
+            titulo = "👇"
+        el = {"title": (titulo or "👇")[:80]}
+        if img:
+            el["image_url"] = img
         if btns:
             el["buttons"] = btns[:3]
-        return {"attachment": {"type": "template",
-                               "payload": {"template_type": "generic", "elements": [el]}}}
-    return None
+        msgs.append({"attachment": {"type": "template",
+                                    "payload": {"template_type": "generic", "elements": [el]}}})
+        return msgs
+    return []
 
 
 def _ig_nome(igsid, token):
@@ -539,19 +547,19 @@ def _disparo_worker(steps, story, excluir, delay, limite, fallback):
         nome = _ig_nome(p["from_id"], token) or fallback
         ok_all = True
         for step in steps:
-            msg = _montar_msg(step, nome, fallback)
-            if not msg:
-                continue
-            ok, resp = _ig_send(p["from_id"], msg, token)
-            if not ok:
-                ok_all = False
-                _DISPARO["ultimo_erro"] = json.dumps(resp)[:300]
-                low = json.dumps(resp).lower()
-                if any(k in low for k in ("rate", "spam", "block", "limit",
-                                          "too many", "#10", "#613", "#551")):
-                    _DISPARO["parar"] = True
+            for msg in _montar_msgs(step, nome, fallback):
+                ok, resp = _ig_send(p["from_id"], msg, token)
+                if not ok:
+                    ok_all = False
+                    _DISPARO["ultimo_erro"] = json.dumps(resp)[:300]
+                    low = json.dumps(resp).lower()
+                    if any(k in low for k in ("rate", "spam", "block", "limit",
+                                              "too many", "#10", "#613", "#551")):
+                        _DISPARO["parar"] = True
+                    break
+                time.sleep(0.8)
+            if not ok_all:
                 break
-            time.sleep(0.8)
         if ok_all:
             con.execute("INSERT OR IGNORE INTO enviados(from_id,ts) VALUES(?,?)",
                         (p["from_id"], int(time.time())))
@@ -646,15 +654,17 @@ def disparar_teste(request: Request, user: str = "", fallback: str = ""):
         return {"erro": f"não achei @{user} na base"}
     nome = _ig_nome(igsid, token) or fallback
     passos = []
+    falhou = False
     for step in steps:
-        msg = _montar_msg(step, nome, fallback)
-        if not msg:
-            continue
-        ok, resp = _ig_send(igsid, msg, token)
-        passos.append({"tipo": step["type"], "ok": ok, "erro": None if ok else resp})
-        if not ok:
+        for msg in _montar_msgs(step, nome, fallback):
+            ok, resp = _ig_send(igsid, msg, token)
+            passos.append({"tipo": step["type"], "ok": ok, "erro": None if ok else resp})
+            if not ok:
+                falhou = True
+                break
+            time.sleep(0.8)
+        if falhou:
             break
-        time.sleep(0.8)
     return {"user": uname, "nome_usado": nome, "passos": passos,
             "tudo_ok": all(p["ok"] for p in passos)}
 
