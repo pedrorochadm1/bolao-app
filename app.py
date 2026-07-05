@@ -18,6 +18,7 @@ import random
 import sqlite3
 import secrets
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -36,7 +37,7 @@ TZ_OFFSET     = -3  # America/Sao_Paulo (sem horário de verão hoje)
 
 GRAPH = "https://graph.instagram.com/v21.0"
 SCOPE = "instagram_business_basic,instagram_business_manage_messages"
-BUILD = "cadencia-inicio-a-inicio-v4"  # marcador de versão pra confirmar deploy
+BUILD = "paralelo-v5"  # marcador de versão pra confirmar deploy
 
 app = FastAPI()
 
@@ -528,49 +529,65 @@ def _alvos(con, story, excluir, so_story=True):
     return alvos
 
 
-def _disparo_worker(steps, story, excluir, delay, limite, fallback):
+_LOCK = threading.Lock()
+
+
+def _enviar_um(p, steps, token, fallback, passo):
+    """Envia o fluxo inteiro pra UMA pessoa. Roda em thread do pool."""
+    nome = _ig_nome(p["from_id"], token) or fallback
+    ok_all = True
+    for step in steps:
+        for msg in _montar_msgs(step, nome, fallback):
+            if _DISPARO["parar"]:
+                return
+            ok, resp = _ig_send(p["from_id"], msg, token)
+            if not ok:
+                ok_all = False
+                low = json.dumps(resp).lower()
+                with _LOCK:
+                    _DISPARO["ultimo_erro"] = json.dumps(resp)[:300]
+                if any(k in low for k in ("rate", "spam", "block", "limit",
+                                          "too many", "#10", "#613", "#551")):
+                    _DISPARO["parar"] = True   # sinaliza parada geral
+                break
+            time.sleep(passo)
+        if not ok_all:
+            break
+    with _LOCK:
+        if ok_all:
+            c = db()
+            c.execute("INSERT OR IGNORE INTO enviados(from_id,ts) VALUES(?,?)",
+                      (p["from_id"], int(time.time())))
+            c.commit()
+            c.close()
+            _DISPARO["enviados"] += 1
+        else:
+            _DISPARO["falhas"] += 1
+
+
+def _disparo_worker(steps, story, excluir, delay, limite, fallback,
+                    passo=0.3, rate=30, conc=6):
     con = db()
     con.execute("CREATE TABLE IF NOT EXISTS enviados(from_id TEXT PRIMARY KEY, ts INTEGER)")
     con.commit()
     token = setting_get("ig_token", "")
     alvos = _alvos(con, story, excluir)
+    con.close()
     if limite:
         alvos = alvos[:limite]
     _DISPARO.update(total=len(alvos), enviados=0, falhas=0, rodando=True,
                     parar=False, ultimo_erro="", iniciado=datetime.now(timezone.utc).isoformat())
+    # paralelo moderado: solta uma pessoa nova a cada ~base seg (ritmo agregado),
+    # até `conc` rodando ao mesmo tempo. rate = pessoas por minuto.
+    base = 60.0 / rate if rate > 0 else max(1.0, delay)
+    ex = ThreadPoolExecutor(max_workers=conc)
     for p in alvos:
         if _DISPARO["parar"]:
             break
-        t0 = time.time()
-        nome = _ig_nome(p["from_id"], token) or fallback
-        ok_all = True
-        for step in steps:
-            for msg in _montar_msgs(step, nome, fallback):
-                ok, resp = _ig_send(p["from_id"], msg, token)
-                if not ok:
-                    ok_all = False
-                    _DISPARO["ultimo_erro"] = json.dumps(resp)[:300]
-                    low = json.dumps(resp).lower()
-                    if any(k in low for k in ("rate", "spam", "block", "limit",
-                                              "too many", "#10", "#613", "#551")):
-                        _DISPARO["parar"] = True
-                    break
-                time.sleep(0.8)
-            if not ok_all:
-                break
-        if ok_all:
-            con.execute("INSERT OR IGNORE INTO enviados(from_id,ts) VALUES(?,?)",
-                        (p["from_id"], int(time.time())))
-            con.commit()
-            _DISPARO["enviados"] += 1
-        else:
-            _DISPARO["falhas"] += 1
-        # intervalo medido do INÍCIO de uma pessoa ao início da próxima:
-        # o tempo de envio do fluxo já conta, não soma em cima. Com jitter.
-        alvo = random.uniform(max(1.0, delay * 0.75), delay * 1.6)
-        time.sleep(max(0.0, alvo - (time.time() - t0)))
+        ex.submit(_enviar_um, p, steps, token, fallback, passo)
+        time.sleep(random.uniform(base * 0.75, base * 1.25))
+    ex.shutdown(wait=True)
     _DISPARO["rodando"] = False
-    con.close()
 
 
 @app.post("/flow")
@@ -593,7 +610,8 @@ def get_flow(request: Request):
 
 @app.post("/disparar")
 def disparar(request: Request, excluir: str = "", story: str = Query(default=""),
-             delay: float = 2.0, limite: int = 0, fallback: str = "", dry: int = 0):
+             delay: float = 2.0, limite: int = 0, fallback: str = "", dry: int = 0,
+             rate: float = 30, conc: int = 6, passo: float = 0.3):
     _check_auth(request)
     if _DISPARO["rodando"]:
         return {"erro": "já está rodando", "status": _DISPARO}
@@ -611,11 +629,14 @@ def disparar(request: Request, excluir: str = "", story: str = Query(default="")
     n = min(len(alvos), limite) if limite else len(alvos)
     if dry:
         return {"dry_run": True, "vao_receber": n, "blocos": len(steps),
-                "excluidos": excl, "delay": delay, "amostra": [a["username"] for a in alvos[:10]]}
+                "excluidos": excl, "rate_min": rate, "conc": conc,
+                "amostra": [a["username"] for a in alvos[:10]]}
     t = threading.Thread(target=_disparo_worker,
-                         args=(steps, story, excl, delay, limite, fallback), daemon=True)
+                         args=(steps, story, excl, delay, limite, fallback, passo, rate, conc),
+                         daemon=True)
     t.start()
-    return {"ok": True, "iniciado": True, "vao_receber": n, "blocos": len(steps), "delay": delay}
+    return {"ok": True, "iniciado": True, "vao_receber": n, "blocos": len(steps),
+            "rate_min": rate, "conc": conc, "eta_min": round(n / rate) if rate else None}
 
 
 @app.get("/disparo-status")
