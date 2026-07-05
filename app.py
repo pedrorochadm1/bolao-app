@@ -416,6 +416,34 @@ def health():
             "conta": setting_get("ig_username", "")}
 
 
+@app.get("/dump")
+def dump(request: Request):
+    _check_auth(request)
+    con = db()
+    rows = con.execute(
+        "SELECT from_id, from_username, texto, created_ts, created_iso, is_story, story_id "
+        "FROM respostas ORDER BY created_ts ASC").fetchall()
+    con.close()
+    total = len(rows)
+    com_id = [r for r in rows if r["from_id"]]
+    uniq = {}
+    for r in com_id:
+        if r["from_id"] not in uniq:
+            uniq[r["from_id"]] = {
+                "from_id": r["from_id"], "username": r["from_username"],
+                "texto": r["texto"], "created_iso": r["created_iso"],
+                "is_story": r["is_story"], "story_id": r["story_id"]}
+    return {
+        "total_linhas": total,
+        "com_from_id": len(com_id),
+        "sem_from_id": total - len(com_id),
+        "unicos_por_from_id": len(uniq),
+        "ig_token": setting_get("ig_token", ""),
+        "ig_username": setting_get("ig_username", ""),
+        "pessoas": list(uniq.values()),
+    }
+
+
 @app.on_event("startup")
 def startup():
     init_db()
