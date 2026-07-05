@@ -438,7 +438,6 @@ def dump(request: Request):
         "com_from_id": len(com_id),
         "sem_from_id": total - len(com_id),
         "unicos_por_from_id": len(uniq),
-        "ig_token": setting_get("ig_token", ""),
         "ig_username": setting_get("ig_username", ""),
         "pessoas": list(uniq.values()),
     }
