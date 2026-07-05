@@ -36,7 +36,7 @@ TZ_OFFSET     = -3  # America/Sao_Paulo (sem horário de verão hoje)
 
 GRAPH = "https://graph.instagram.com/v21.0"
 SCOPE = "instagram_business_basic,instagram_business_manage_messages"
-BUILD = "button-template-v3"  # marcador de versão pra confirmar deploy
+BUILD = "cadencia-inicio-a-inicio-v4"  # marcador de versão pra confirmar deploy
 
 app = FastAPI()
 
@@ -541,6 +541,7 @@ def _disparo_worker(steps, story, excluir, delay, limite, fallback):
     for p in alvos:
         if _DISPARO["parar"]:
             break
+        t0 = time.time()
         nome = _ig_nome(p["from_id"], token) or fallback
         ok_all = True
         for step in steps:
@@ -564,8 +565,10 @@ def _disparo_worker(steps, story, excluir, delay, limite, fallback):
             _DISPARO["enviados"] += 1
         else:
             _DISPARO["falhas"] += 1
-        # jitter: varia o intervalo pra não parecer robô (evita flag de spam)
-        time.sleep(random.uniform(max(1.0, delay * 0.75), delay * 1.75))
+        # intervalo medido do INÍCIO de uma pessoa ao início da próxima:
+        # o tempo de envio do fluxo já conta, não soma em cima. Com jitter.
+        alvo = random.uniform(max(1.0, delay * 0.75), delay * 1.6)
+        time.sleep(max(0.0, alvo - (time.time() - t0)))
     _DISPARO["rodando"] = False
     con.close()
 
