@@ -443,6 +443,184 @@ def dump(request: Request):
     }
 
 
+# ------------------------------------------------------------------ disparo
+FLOW_FILE = os.path.join(os.path.dirname(DB_PATH) or ".", "flow.json")
+_DISPARO = {"rodando": False, "total": 0, "enviados": 0, "falhas": 0,
+            "ultimo_erro": "", "parar": False, "iniciado": ""}
+
+
+def _personalizar(texto, nome, fallback=""):
+    if "{primeiro_nome}" not in (texto or ""):
+        return texto
+    val = nome if nome else fallback
+    out = (texto or "").replace("{primeiro_nome}", val)
+    return " ".join(out.split()) if not val else out
+
+
+def _url_ok(u):
+    u = (u or "").strip()
+    return u if u.startswith(("http://", "https://")) else "https://" + u
+
+
+def _montar_msg(step, nome, fallback):
+    t = step.get("type")
+    if t == "text":
+        return {"text": _personalizar(step.get("text", ""), nome, fallback)}
+    if t == "image":
+        return {"attachment": {"type": "image",
+                               "payload": {"url": step["url"], "is_reusable": True}}}
+    if t == "buttons":
+        texto = _personalizar(step.get("text", ""), nome, fallback) or " "
+        el = {"title": texto[:80]}
+        if len(texto) > 80:
+            el["subtitle"] = texto[80:160]
+        if step.get("image_url"):
+            el["image_url"] = step["image_url"]
+        btns = [{"type": "web_url", "url": _url_ok(b["url"]),
+                 "title": (b.get("label") or b["url"])[:20]}
+                for b in step.get("buttons", []) if b.get("url")]
+        if btns:
+            el["buttons"] = btns[:3]
+        return {"attachment": {"type": "template",
+                               "payload": {"template_type": "generic", "elements": [el]}}}
+    return None
+
+
+def _ig_nome(igsid, token):
+    r = _fetch_json(f"{GRAPH}/{igsid}", {"fields": "name", "access_token": token})
+    nome = (r.get("name") or "").strip()
+    return nome.split()[0] if nome else ""
+
+
+def _ig_send(igsid, message, token):
+    try:
+        r = requests.post(f"{GRAPH}/me/messages", params={"access_token": token},
+                          json={"recipient": {"id": igsid}, "message": message}, timeout=30)
+        try:
+            j = r.json()
+        except Exception:
+            j = {"status_code": r.status_code}
+        return r.ok, j
+    except Exception as e:  # noqa: BLE001
+        return False, {"error": str(e)}
+
+
+def _alvos(con, story, excluir, so_story=True):
+    dia = _hoje_sp()
+    rows = _query_rows(con, dia, 1 if so_story else 0, story)
+    excl = {e.strip().lower().lstrip("@") for e in excluir if e.strip()}
+    ja = {r["from_id"] for r in con.execute("SELECT from_id FROM enviados")}
+    vistos, alvos = set(), []
+    for r in rows:
+        fid = r["from_id"]
+        if not fid or fid in vistos or fid in ja:
+            continue
+        if (r["from_username"] or "").lower().lstrip("@") in excl:
+            continue
+        vistos.add(fid)
+        alvos.append({"from_id": fid, "username": r["from_username"]})
+    return alvos
+
+
+def _disparo_worker(steps, story, excluir, delay, limite, fallback):
+    con = db()
+    con.execute("CREATE TABLE IF NOT EXISTS enviados(from_id TEXT PRIMARY KEY, ts INTEGER)")
+    con.commit()
+    token = setting_get("ig_token", "")
+    alvos = _alvos(con, story, excluir)
+    if limite:
+        alvos = alvos[:limite]
+    _DISPARO.update(total=len(alvos), enviados=0, falhas=0, rodando=True,
+                    parar=False, ultimo_erro="", iniciado=datetime.now(timezone.utc).isoformat())
+    for p in alvos:
+        if _DISPARO["parar"]:
+            break
+        nome = _ig_nome(p["from_id"], token) or fallback
+        ok_all = True
+        for step in steps:
+            msg = _montar_msg(step, nome, fallback)
+            if not msg:
+                continue
+            ok, resp = _ig_send(p["from_id"], msg, token)
+            if not ok:
+                ok_all = False
+                _DISPARO["ultimo_erro"] = json.dumps(resp)[:300]
+                low = json.dumps(resp).lower()
+                if any(k in low for k in ("rate", "spam", "block", "limit",
+                                          "too many", "#10", "#613", "#551")):
+                    _DISPARO["parar"] = True
+                break
+            time.sleep(0.8)
+        if ok_all:
+            con.execute("INSERT OR IGNORE INTO enviados(from_id,ts) VALUES(?,?)",
+                        (p["from_id"], int(time.time())))
+            con.commit()
+            _DISPARO["enviados"] += 1
+        else:
+            _DISPARO["falhas"] += 1
+        time.sleep(delay)
+    _DISPARO["rodando"] = False
+    con.close()
+
+
+@app.post("/flow")
+async def set_flow(request: Request):
+    _check_auth(request)
+    raw = await request.body()
+    data = json.loads(raw or "{}")
+    steps = data.get("steps", [])
+    json.dump({"steps": steps}, open(FLOW_FILE, "w"), ensure_ascii=False)
+    return {"ok": True, "blocos": len(steps)}
+
+
+@app.get("/flow")
+def get_flow(request: Request):
+    _check_auth(request)
+    if os.path.exists(FLOW_FILE):
+        return json.load(open(FLOW_FILE))
+    return {"steps": []}
+
+
+@app.post("/disparar")
+def disparar(request: Request, excluir: str = "", story: str = Query(default=""),
+             delay: float = 2.0, limite: int = 0, fallback: str = "", dry: int = 0):
+    _check_auth(request)
+    if _DISPARO["rodando"]:
+        return {"erro": "já está rodando", "status": _DISPARO}
+    if not os.path.exists(FLOW_FILE):
+        return {"erro": "sem flow no servidor (faça POST /flow primeiro)"}
+    steps = json.load(open(FLOW_FILE)).get("steps", [])
+    if not steps:
+        return {"erro": "flow vazio"}
+    excl = excluir.split(",") if excluir else []
+    con = db()
+    con.execute("CREATE TABLE IF NOT EXISTS enviados(from_id TEXT PRIMARY KEY, ts INTEGER)")
+    con.commit()
+    alvos = _alvos(con, story, excl)
+    con.close()
+    n = min(len(alvos), limite) if limite else len(alvos)
+    if dry:
+        return {"dry_run": True, "vao_receber": n, "blocos": len(steps),
+                "excluidos": excl, "delay": delay, "amostra": [a["username"] for a in alvos[:10]]}
+    t = threading.Thread(target=_disparo_worker,
+                         args=(steps, story, excl, delay, limite, fallback), daemon=True)
+    t.start()
+    return {"ok": True, "iniciado": True, "vao_receber": n, "blocos": len(steps), "delay": delay}
+
+
+@app.get("/disparo-status")
+def disparo_status(request: Request):
+    _check_auth(request)
+    return _DISPARO
+
+
+@app.post("/disparo-parar")
+def disparo_parar(request: Request):
+    _check_auth(request)
+    _DISPARO["parar"] = True
+    return {"ok": True, "parando": True, "status": _DISPARO}
+
+
 @app.on_event("startup")
 def startup():
     init_db()
