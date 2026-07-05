@@ -472,27 +472,34 @@ def _montar_msgs(step, nome, fallback):
         return [{"attachment": {"type": "image",
                                 "payload": {"url": step["url"], "is_reusable": True}}}]
     if t == "buttons":
-        texto = _personalizar(step.get("text", ""), nome, fallback)
+        texto = _personalizar(step.get("text", ""), nome, fallback) or " "
         btns = [{"type": "web_url", "url": _url_ok(b["url"]),
                  "title": (b.get("label") or b["url"])[:20]}
                 for b in step.get("buttons", []) if b.get("url")]
-        img = step.get("image_url")
-        msgs = []
-        titulo = texto
-        # Card corta em ~80 e quebra palavra: texto longo vira bolha, card fica compacto.
-        if len(texto or "") > 76 or "\n" in (texto or ""):
-            if (texto or "").strip():
-                msgs.append({"text": texto})
-            titulo = "👇"
-        el = {"title": (titulo or "👇")[:80]}
-        if img:
-            el["image_url"] = img
+        # card único: botão junto do texto. Título até 80, resto no subtítulo,
+        # sempre quebrando no espaço (nunca no meio da palavra).
+        titulo, subt = _split_card(texto)
+        el = {"title": titulo or " "}
+        if subt:
+            el["subtitle"] = subt
+        if step.get("image_url"):
+            el["image_url"] = step["image_url"]
         if btns:
             el["buttons"] = btns[:3]
-        msgs.append({"attachment": {"type": "template",
-                                    "payload": {"template_type": "generic", "elements": [el]}}})
-        return msgs
+        return [{"attachment": {"type": "template",
+                                "payload": {"template_type": "generic", "elements": [el]}}}]
     return []
+
+
+def _split_card(texto):
+    """Divide o texto do card em titulo (<=80) e subtitulo (<=80) sem cortar palavra."""
+    texto = texto or " "
+    if len(texto) <= 80:
+        return texto, ""
+    corte = texto.rfind(" ", 0, 80)
+    if corte < 40:
+        corte = 80
+    return texto[:corte].rstrip(), texto[corte:].strip()[:80]
 
 
 def _ig_nome(igsid, token):
