@@ -476,30 +476,19 @@ def _montar_msgs(step, nome, fallback):
         btns = [{"type": "web_url", "url": _url_ok(b["url"]),
                  "title": (b.get("label") or b["url"])[:20]}
                 for b in step.get("buttons", []) if b.get("url")]
-        # card único: botão junto do texto. Título até 80, resto no subtítulo,
-        # sempre quebrando no espaço (nunca no meio da palavra).
-        titulo, subt = _split_card(texto)
-        el = {"title": titulo or " "}
-        if subt:
-            el["subtitle"] = subt
+        msgs = []
+        # imagem (se houver) vai antes, como mensagem própria
         if step.get("image_url"):
-            el["image_url"] = step["image_url"]
+            msgs.append({"attachment": {"type": "image",
+                                        "payload": {"url": step["image_url"], "is_reusable": True}}})
         if btns:
-            el["buttons"] = btns[:3]
-        return [{"attachment": {"type": "template",
-                                "payload": {"template_type": "generic", "elements": [el]}}}]
+            # button template: texto longo (até 640) + botão junto, sem truncar (igual ManyChat)
+            msgs.append({"attachment": {"type": "template", "payload": {
+                "template_type": "button", "text": texto[:640], "buttons": btns[:3]}}})
+        else:
+            msgs.append({"text": texto})
+        return msgs
     return []
-
-
-def _split_card(texto):
-    """Divide o texto do card em titulo (<=80) e subtitulo (<=80) sem cortar palavra."""
-    texto = texto or " "
-    if len(texto) <= 80:
-        return texto, ""
-    corte = texto.rfind(" ", 0, 80)
-    if corte < 40:
-        corte = 80
-    return texto[:corte].rstrip(), texto[corte:].strip()[:80]
 
 
 def _ig_nome(igsid, token):
