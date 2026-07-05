@@ -623,6 +623,42 @@ def disparo_parar(request: Request):
     return {"ok": True, "parando": True, "status": _DISPARO}
 
 
+@app.post("/disparar-teste")
+def disparar_teste(request: Request, user: str = "", fallback: str = ""):
+    """Manda o fluxo salvo pra UMA pessoa (teste). Não marca em 'enviados'."""
+    _check_auth(request)
+    if not os.path.exists(FLOW_FILE):
+        return {"erro": "sem flow no servidor"}
+    steps = json.load(open(FLOW_FILE)).get("steps", [])
+    if not steps:
+        return {"erro": "flow vazio"}
+    token = setting_get("ig_token", "")
+    u = user.lower().lstrip("@")
+    con = db()
+    row = con.execute("SELECT from_id, from_username FROM respostas "
+                      "WHERE lower(from_username)=? LIMIT 1", (u,)).fetchone()
+    con.close()
+    if row:
+        igsid, uname = row["from_id"], row["from_username"]
+    elif user.isdigit():
+        igsid, uname = user, user
+    else:
+        return {"erro": f"não achei @{user} na base"}
+    nome = _ig_nome(igsid, token) or fallback
+    passos = []
+    for step in steps:
+        msg = _montar_msg(step, nome, fallback)
+        if not msg:
+            continue
+        ok, resp = _ig_send(igsid, msg, token)
+        passos.append({"tipo": step["type"], "ok": ok, "erro": None if ok else resp})
+        if not ok:
+            break
+        time.sleep(0.8)
+    return {"user": uname, "nome_usado": nome, "passos": passos,
+            "tudo_ok": all(p["ok"] for p in passos)}
+
+
 @app.on_event("startup")
 def startup():
     init_db()
