@@ -36,6 +36,7 @@ TZ_OFFSET     = -3  # America/Sao_Paulo (sem horário de verão hoje)
 
 GRAPH = "https://graph.instagram.com/v21.0"
 SCOPE = "instagram_business_basic,instagram_business_manage_messages"
+BUILD = "button-template-v3"  # marcador de versão pra confirmar deploy
 
 app = FastAPI()
 
@@ -413,7 +414,7 @@ def export_csv(request: Request, data: str = Query(default=""),
 
 @app.get("/health")
 def health():
-    return {"ok": True, "autorizado": bool(setting_get("ig_token")),
+    return {"ok": True, "build": BUILD, "autorizado": bool(setting_get("ig_token")),
             "conta": setting_get("ig_username", "")}
 
 
